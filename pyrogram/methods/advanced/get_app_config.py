@@ -16,12 +16,24 @@
 #  You should have received a copy of the GNU Lesser General Public License
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
-from .get_app_config import GetAppConfig
-from .invoke import Invoke
-from .recover_gaps import RecoverGaps
-from .resolve_peer import ResolvePeer
-from .save_file import SaveFile
+from __future__ import annotations as _annotations
 
 
-class Advanced(GetAppConfig, Invoke, RecoverGaps, ResolvePeer, SaveFile):
-    pass
+import pyrogram
+from pyrogram import raw, utils
+
+
+class GetAppConfig:
+    async def get_app_config(self: pyrogram.Client) -> dict:
+        """Get app-specific configuration.
+
+        .. include:: /_includes/usable-by/users.rst
+
+        Returns:
+            ``dict``: App-specific configuration is returned.
+        """
+        r = await self.invoke(raw.functions.help.GetAppConfig(hash=0))
+
+        self._app_config = r
+
+        return utils.jsonvalue_to_obj(r.config)
