@@ -17,13 +17,14 @@
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
 import asyncio
+import time
 import bisect
 import logging
 import os
 from enum import Enum, auto
 from hashlib import sha1
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Coroutine, Dict, List, Optional, Set
 
 import pyrogram
 from pyrogram import raw, utils
@@ -41,7 +42,7 @@ from pyrogram.errors import (
     Unauthorized,
 )
 from pyrogram.raw.all import layer
-from pyrogram.raw.core import FutureSalts, Int, MsgContainer, TLObject
+from pyrogram.raw.core import FutureSalt, FutureSalts, Int, MsgContainer, TLObject
 
 from .internals import MsgFactory
 
@@ -72,15 +73,17 @@ class InvalidDC(TransportError):
 
 
 class Result:
-    __slots__ = ("value", "event")
+    __slots__ = ("value", "event", "exception")
 
     def __init__(self):
         self.value: Any = None
         self.event: asyncio.Event = asyncio.Event()
+        self.exception: Optional[Exception] = None
 
 
 class Session:
     START_TIMEOUT = 2
+    STOP_TIMEOUT = 2
     WAIT_TIMEOUT = 15
     SLEEP_THRESHOLD = 10
     MAX_RETRIES = 10
@@ -90,6 +93,10 @@ class Session:
     STORED_MSG_IDS_MAX_SIZE = 1000 * 2
     CRYPTO_EXECUTOR_WORKERS = 1
     RESTART_RETRY_DELAY = 5
+    SILENCE_TIMEOUT = 30
+    FUTURE_SALTS_COUNT = 64
+    FUTURE_SALTS_THRESHOLD = 60
+    FUTURE_SALTS_INTERVAL = 60
     MAX_CONSECUTIVE_IGNORED = 30
 
     def __init__(
@@ -123,6 +130,11 @@ class Session:
         self.msg_factory = MsgFactory(self.client)
 
         self.salt = 0
+        self.salt_valid_until: float = 0.0
+        self.future_salts: List[FutureSalt] = []
+        self._future_salts_requested_at: float = 0.0
+
+        self.last_received_at: float = time.monotonic()
 
         self.ignore_count = 0
 
@@ -138,8 +150,12 @@ class Session:
 
         self.recv_task: Optional[asyncio.Task] = None
 
+        self.pending_tasks: Set[asyncio.Task] = set()
+
         self.is_started = asyncio.Event()
         self.restart_lock = asyncio.Lock()
+
+        self._must_stay_stopped: bool = False
 
     @property
     def state(self) -> SessionState:
@@ -153,6 +169,28 @@ class Session:
             self._state = new_state
 
             log.debug("Session state changed: %s -> %s", old_state.name, new_state.name)
+
+    def _create_tracked_task(self, coroutine: Coroutine[Any, Any, Any]) -> asyncio.Task:
+        task = self.client.loop.create_task(coroutine)
+
+        self.pending_tasks.add(task)
+        task.add_done_callback(self.pending_tasks.discard)
+
+        return task
+
+    async def _wait_pending_tasks(self) -> None:
+        current = asyncio.current_task()
+
+        while self.pending_tasks - {current}:
+            round_tasks = set(self.pending_tasks) - {current}
+            _, running = await asyncio.wait(round_tasks, timeout=self.STOP_TIMEOUT)
+
+            for task in running:
+                task.cancel()
+
+            for result in await asyncio.gather(*round_tasks, return_exceptions=True):
+                if isinstance(result, Exception):
+                    log.error("Task failed while the session was stopping", exc_info=result)
 
     async def start(self):
         if self._state in (SessionState.STARTED, SessionState.STARTING):
@@ -176,6 +214,7 @@ class Session:
         try:
             await self.connection.connect()
 
+            self.last_received_at = time.monotonic()
             self.recv_task = self.client.loop.create_task(self.recv_worker())
 
             await self.send(raw.functions.Ping(ping_id=0), timeout=self.START_TIMEOUT)
@@ -219,7 +258,7 @@ class Session:
             self.client.loop.create_task(self.restart())
             return
         except Exception as e:
-            await self.stop()
+            await self._stop()
             raise e
 
         await self._set_state(SessionState.STARTED)
@@ -234,6 +273,11 @@ class Session:
                 log.exception(e)
 
     async def stop(self):
+        self._must_stay_stopped = True
+
+        await self._stop()
+
+    async def _stop(self) -> None:
         if self._state in (SessionState.STOPPED, SessionState.STOPPING):
             log.debug("Session already stopped")
             return
@@ -245,6 +289,14 @@ class Session:
         self.is_started.clear()
 
         self.stored_msg_ids.clear()
+
+        self.pending_acks.clear()
+
+        for result in self.results.values():
+            result.exception = TimeoutError("Session stopped before an answer arrived")
+            result.event.set()
+
+        self.results.clear()
 
         self.ping_task_event.set()
 
@@ -258,6 +310,8 @@ class Session:
         if self.recv_task:
             await self.recv_task
             self.recv_task = None
+
+        await self._wait_pending_tasks()
 
         await self._set_state(SessionState.STOPPED)
 
@@ -275,8 +329,15 @@ class Session:
                self.recent_msg_ids = self.stored_msg_ids[:30]
 
             try:
-                await self.stop()
+                await self._stop()
+
+                if self._must_stay_stopped:
+                    return
+
                 await self.start()
+
+                if self._must_stay_stopped:
+                    await self._stop()
             except (AuthKeyDuplicated, Unauthorized):
                 raise
             except Exception as e:
@@ -303,6 +364,9 @@ class Session:
             await self.restart()
 
     def _still_wanted(self) -> bool:
+        if self._must_stay_stopped:
+            return False
+
         client = self.client
 
         if not getattr(client, "is_connected", False):
@@ -409,7 +473,10 @@ class Session:
 
             msg_id = None
 
-            if isinstance(msg.body, (raw.types.BadMsgNotification, raw.types.BadServerSalt)):
+            if isinstance(msg.body, raw.types.BadServerSalt):
+                msg_id = msg.body.bad_msg_id
+                self.salt = msg.body.new_server_salt
+            elif isinstance(msg.body, raw.types.BadMsgNotification):
                 msg_id = msg.body.bad_msg_id
             elif isinstance(msg.body, (FutureSalts, raw.types.RpcResult)):
                 msg_id = msg.body.req_msg_id
@@ -417,7 +484,7 @@ class Session:
                 msg_id = msg.body.msg_id
             else:
                 if self.client is not None:
-                    self.client.loop.create_task(self.client.handle_updates(msg.body))
+                    self._create_tracked_task(self.client.handle_updates(msg.body))
 
             if msg_id in self.results:
                 self.results[msg_id].value = getattr(msg.body, "result", msg.body)
@@ -459,7 +526,50 @@ class Session:
             except RPCError:
                 pass
 
+            silence = time.monotonic() - self.last_received_at
+            if silence > self.SILENCE_TIMEOUT:
+                log.info("Restarting session due to - no answer from the server for %.0fs", silence)
+                self.client.loop.create_task(self.restart())
+                break
+
+            try:
+                await self._update_future_salts()
+            except (OSError, RPCError) as e:
+                log.info("Could not get future salts - %s - %s", e.__class__.__name__, e)
+
         log.info("PingTask stopped")
+
+    def _current_salt(self, server_time: float) -> int:
+        while self.future_salts and self.future_salts[0].valid_since <= server_time:
+            salt = self.future_salts.pop(0)
+
+            self.salt = salt.salt
+            self.salt_valid_until = salt.valid_until
+
+        return self.salt
+
+    async def _update_future_salts(self) -> None:
+        if self.is_cdn:
+            return
+
+        server_time = self.client.server_time
+
+        if server_time - self._future_salts_requested_at < self.FUTURE_SALTS_INTERVAL:
+            return
+
+        self._current_salt(server_time)
+
+        if self.future_salts and self.salt_valid_until - server_time > self.FUTURE_SALTS_THRESHOLD:
+            return
+
+        self._future_salts_requested_at = server_time
+
+        future_salts = await self.send(
+            raw.functions.GetFutureSalts(num=self.FUTURE_SALTS_COUNT),
+            timeout=self.START_TIMEOUT,
+        )
+
+        self.future_salts = sorted(future_salts.salts, key=lambda salt: salt.valid_since)
 
     async def recv_worker(self):
         log.info("NetworkTask started")
@@ -504,7 +614,8 @@ class Session:
 
                 break
 
-            self.client.loop.create_task(self.handle_packet(packet))
+            self.last_received_at = time.monotonic()
+            self._create_tracked_task(self.handle_packet(packet))
 
         log.info("NetworkTask stopped")
 
@@ -514,8 +625,11 @@ class Session:
         message = await self.msg_factory.create(data)
         msg_id = message.msg_id
 
+        pending_result: Optional[Result] = None
+
         if wait_response:
-            self.results[msg_id] = Result()
+            pending_result = Result()
+            self.results[msg_id] = pending_result
 
         log.debug("Sent: %s", message)
 
@@ -523,7 +637,7 @@ class Session:
             self.connection.protocol.crypto_executor,
             mtproto.pack,
             message,
-            self.salt,
+            self._current_salt(self.client.server_time),
             self.session_id,
             self.auth_key,
             self.auth_key_id
@@ -535,13 +649,18 @@ class Session:
             self.results.pop(msg_id, None)
             raise e
 
-        if wait_response:
+        if pending_result is not None:
             try:
-                await asyncio.wait_for(self.results[msg_id].event.wait(), timeout)
+                await asyncio.wait_for(pending_result.event.wait(), timeout)
             except asyncio.TimeoutError:
                 pass
 
-            result = self.results.pop(msg_id).value
+            self.results.pop(msg_id, None)
+
+            if pending_result.exception is not None:
+                raise pending_result.exception
+
+            result = pending_result.value
 
             if result is None:
                 raise TimeoutError("Request timed out")
@@ -560,7 +679,6 @@ class Session:
                 )
 
             if isinstance(result, raw.types.BadServerSalt):
-                self.salt = result.new_server_salt
                 return await self.send(data, wait_response, timeout)
 
             return result
@@ -573,11 +691,6 @@ class Session:
         sleep_threshold: float = SLEEP_THRESHOLD,
         retry_delay: float = RETRY_DELAY
     ):
-        try:
-            await asyncio.wait_for(self.is_started.wait(), self.WAIT_TIMEOUT)
-        except asyncio.TimeoutError:
-            pass
-
         if isinstance(
             query, (raw.functions.InvokeWithoutUpdates, raw.functions.InvokeWithTakeout)
         ):
@@ -586,6 +699,13 @@ class Session:
             inner_query = query
 
         query_name = ".".join(inner_query.QUALNAME.split(".")[1:])
+
+        try:
+            await asyncio.wait_for(self.is_started.wait(), self.WAIT_TIMEOUT)
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(
+                f'Waited {self.WAIT_TIMEOUT}s to invoke "{query_name}", and {self} is not started'
+            ) from e
 
         for attempt in range(1, retries + 1):
             try:

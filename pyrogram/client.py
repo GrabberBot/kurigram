@@ -1391,9 +1391,39 @@ class Client(Methods):
 
         sessions = self.media_sessions if is_media else self.sessions
 
-        if not temporary and sessions.get(dc_id):
+        if temporary:
+            return await self._new_session(
+                dc_id, is_media, is_cdn, is_current_dc, sessions,
+                export_authorization, server_address, port, temporary,
+            )
+
+        if sessions.get(dc_id):
             return sessions[dc_id]
 
+        locks = self.__dict__.setdefault("_session_creation_locks", {})
+        lock = locks.setdefault((is_media, dc_id), asyncio.Lock())
+
+        async with lock:
+            if sessions.get(dc_id):
+                return sessions[dc_id]
+
+            return await self._new_session(
+                dc_id, is_media, is_cdn, is_current_dc, sessions,
+                export_authorization, server_address, port, temporary,
+            )
+
+    async def _new_session(
+        self,
+        dc_id: int,
+        is_media: bool,
+        is_cdn: bool,
+        is_current_dc: bool,
+        sessions: dict,
+        export_authorization: bool,
+        server_address: Optional[str],
+        port: Optional[int],
+        temporary: bool,
+    ) -> "Session":
         if not server_address or not port:
             dc_option = await self.get_dc_option(dc_id, is_media=is_media, ipv6=self.ipv6, is_cdn=is_cdn)
 
