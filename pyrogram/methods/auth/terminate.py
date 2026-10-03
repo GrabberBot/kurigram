@@ -57,6 +57,12 @@ class Terminate:
 
         self.media_sessions.clear()
 
+        for pool in tuple(self.media_pool.values()):
+            for pool_session in tuple(pool):
+                await pool_session.stop()
+
+        self.media_pool.clear()
+
         for dc_session in tuple(self.sessions.values()):
             await dc_session.stop()
 

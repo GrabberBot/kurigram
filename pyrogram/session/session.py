@@ -119,6 +119,7 @@ class Session:
         self.is_media = is_media
         self.is_cdn = is_cdn
         self.cdn_initialized = False
+        self.busy = 0
 
         self.connection: Optional[Connection] = None
 
@@ -377,10 +378,17 @@ class Session:
         if self is getattr(client, "session", None):
             return True
 
-        return any(
+        if any(
             self is session
             for registry in (getattr(client, "media_sessions", {}), getattr(client, "sessions", {}))
             for session in registry.values()
+        ):
+            return True
+
+        return any(
+            self is session
+            for pool in getattr(client, "media_pool", {}).values()
+            for session in pool
         )
 
     async def handle_packet(self, packet):
@@ -528,9 +536,9 @@ class Session:
             except RPCError:
                 pass
 
-            silence = time.monotonic() - self.last_received_at
+            silence = self.silence()
             if silence > self.SILENCE_TIMEOUT:
-                log.info("Restarting session due to - no answer from the server for %.0fs", silence)
+                log.warning("Restarting %s due to - no answer from the server for %.0fs", self, silence)
                 self.client.loop.create_task(self.restart())
                 break
 
@@ -540,6 +548,12 @@ class Session:
                 log.info("Could not get future salts - %s - %s", e.__class__.__name__, e)
 
         log.info("PingTask stopped")
+
+    def silence(self) -> float:
+        heard = self.last_received_at
+        protocol = getattr(self.connection, "protocol", None)
+        heard = max(heard, getattr(protocol, "last_activity", heard))
+        return time.monotonic() - heard
 
     def _current_salt(self, server_time: float) -> int:
         while self.future_salts and self.future_salts[0].valid_since <= server_time:

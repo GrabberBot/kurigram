@@ -40,6 +40,7 @@ from pyrogram import __license__, __version__, enums, raw, utils
 from pyrogram.connection.transport.tcp import ProxyDict
 from pyrogram.crypto import aes, rsa
 from pyrogram.raw.all import layer
+from pyrogram.raw.core import TLObject
 from pyrogram.errors import (
     AuthBytesInvalid,
     AuthTokenExpired,
@@ -270,6 +271,7 @@ class Client(Methods):
 
     MAX_CONCURRENT_TRANSMISSIONS = 1
     DOWNLOAD_PARALLELISM = 1
+    MEDIA_CONNECTIONS = 1
     MAX_MESSAGE_CACHE_SIZE = 1000
     MAX_TOPIC_CACHE_SIZE = 1000
 
@@ -393,6 +395,7 @@ class Client(Methods):
 
         self.sessions = {}
         self.media_sessions = {}
+        self.media_pool: Dict[int, List[Session]] = {}
         self.sessions_lock = asyncio.Lock()
 
         self.save_file_semaphore = asyncio.Semaphore(self.max_concurrent_transmissions)
@@ -1175,15 +1178,16 @@ class Client(Methods):
             dc_id = file_id.dc_id
 
             try:
-                session = await self.get_session(dc_id, is_media=True)
+                media_sessions = await self.get_media_sessions(dc_id)
+                session = media_sessions[0]
 
-                r = await session.invoke(
+                r = await self._invoke_least_busy(
+                    media_sessions,
                     raw.functions.upload.GetFile(
                         location=location,
                         offset=offset_bytes,
                         limit=chunk_size
-                    ),
-                    sleep_threshold=30
+                    )
                 )
 
                 if isinstance(r, raw.types.upload.File):
@@ -1199,13 +1203,13 @@ class Client(Methods):
 
                     def request_part(index: int) -> asyncio.Task:
                         return self.loop.create_task(
-                            session.invoke(
+                            self._invoke_least_busy(
+                                media_sessions,
                                 raw.functions.upload.GetFile(
                                     location=location,
                                     offset=start_bytes + index * chunk_size,
                                     limit=chunk_size
-                                ),
-                                sleep_threshold=30
+                                )
                             )
                         )
 
@@ -1243,13 +1247,13 @@ class Client(Methods):
                             if current in ahead:
                                 r = await ahead.pop(current)
                             else:
-                                r = await session.invoke(
+                                r = await self._invoke_least_busy(
+                                    media_sessions,
                                     raw.functions.upload.GetFile(
                                         location=location,
                                         offset=offset_bytes,
                                         limit=chunk_size
-                                    ),
-                                    sleep_threshold=30
+                                    )
                                 )
 
                             if not isinstance(r, raw.types.upload.File):
@@ -1405,6 +1409,75 @@ class Client(Methods):
                             await asyncio.gather(*ahead.values(), return_exceptions=True)
             except Exception as e:
                 raise e
+
+    async def get_media_sessions(self, dc_id: int) -> List["Session"]:
+        primary = await self.get_session(dc_id, is_media=True)
+
+        if self.MEDIA_CONNECTIONS <= 1:
+            return [primary]
+
+        pool = self.media_pool.setdefault(dc_id, [])
+        pool[:] = [
+            session for session in pool
+            if not session._must_stay_stopped and session.auth_key == primary.auth_key
+        ]
+
+        locks = self.__dict__.setdefault("_media_pool_locks", {})
+        lock = locks.setdefault(dc_id, asyncio.Lock())
+
+        if len(pool) < self.MEDIA_CONNECTIONS - 1 and not lock.locked():
+            self.loop.create_task(self._grow_media_pool(dc_id, primary, lock))
+
+        return [primary, *pool]
+
+    async def _grow_media_pool(self, dc_id: int, primary: "Session", lock: asyncio.Lock) -> None:
+        async with lock:
+            pool = self.media_pool.setdefault(dc_id, [])
+
+            while len(pool) < self.MEDIA_CONNECTIONS - 1 and self.is_connected:
+                session = Session(
+                    self,
+                    dc_id,
+                    primary.server_address,
+                    primary.port,
+                    primary.auth_key,
+                    await self.storage.test_mode(),
+                    is_media=True
+                )
+
+                try:
+                    await session.start()
+                except Exception as e:
+                    log.warning("Could not open another media connection to DC%s: %s", dc_id, e)
+
+                    try:
+                        await session.stop()
+                    except Exception as stop_error:
+                        log.debug("Could not stop a media connection that failed to start: %s", stop_error)
+
+                    return
+
+                pool.append(session)
+
+    @staticmethod
+    async def _invoke_least_busy(sessions: List["Session"], query: TLObject):
+        session = sessions[0]
+
+        if len(sessions) > 1:
+            session = min(
+                sessions,
+                key=lambda candidate: (
+                    not candidate.is_started.is_set(),
+                    getattr(candidate, "busy", 0)
+                )
+            )
+
+        session.busy = getattr(session, "busy", 0) + 1
+
+        try:
+            return await session.invoke(query, sleep_threshold=30)
+        finally:
+            session.busy -= 1
 
     async def get_session(
         self,

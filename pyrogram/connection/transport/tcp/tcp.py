@@ -20,6 +20,7 @@ import asyncio
 import logging
 import re
 import socket
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple, TypedDict, Union
 from urllib.parse import parse_qs
@@ -62,6 +63,7 @@ class TCP:
 
         self.marker_event = asyncio.Event()
         self.lock = asyncio.Lock()
+        self.last_activity = time.monotonic()
 
         if isinstance(loop, asyncio.AbstractEventLoop):
             self.loop = loop
@@ -253,6 +255,7 @@ class TCP:
             else:
                 if chunk:
                     data += chunk
+                    self.last_activity = time.monotonic()
                     log.debug(
                         "Received chunk: %d bytes (%d/%d total)", len(chunk), len(data), length
                     )
