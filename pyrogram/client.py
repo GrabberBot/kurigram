@@ -1464,7 +1464,7 @@ class Client(Methods):
         try:
             await session.start()
 
-            if not is_current_dc and export_authorization and not is_cdn:
+            if not is_current_dc and export_authorization and not is_cdn and not is_media:
                 for _ in range(3):
                     exported_auth = await self.invoke(
                         raw.functions.auth.ExportAuthorization(

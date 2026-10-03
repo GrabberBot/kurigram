@@ -234,3 +234,43 @@ def test_later_cdn_requests_are_not_wrapped_again(monkeypatch):
     queries = [q for q in cdn.queries if q != "stopped"]
     assert isinstance(queries[0], raw.functions.InvokeWithLayer)
     assert isinstance(queries[1], raw.functions.upload.GetCdnFile)
+
+
+def test_a_media_session_to_another_dc_reuses_the_authorized_key(monkeypatch):
+    """Ключ основной сессии DC уже авторизован; повторный импорт — лишние круги и AUTH_BYTES_INVALID."""
+    invoked = []
+    started = []
+
+    async def start(self):
+        started.append((self.dc_id, self.is_media))
+
+    async def create(self):
+        return os.urandom(256)
+
+    async def session_invoke(self, query, *args, **kwargs):
+        invoked.append(type(query).__name__)
+        return raw.types.auth.Authorization(user=raw.types.UserEmpty(id=1))
+
+    monkeypatch.setattr(Session, "start", start)
+    monkeypatch.setattr(Session, "invoke", session_invoke)
+    monkeypatch.setattr("pyrogram.client.Auth.create", create)
+
+    async def scenario():
+        client = await offline_client()
+        await client.storage.dc_id(5)
+        client.get_dc_option = dc_option()
+
+        async def invoke(query, *args, **kwargs):
+            invoked.append(type(query).__name__)
+            return raw.types.auth.ExportedAuthorization(id=1, bytes=b"x")
+
+        client.invoke = invoke
+        media = await client.get_session(2, is_media=True)
+        return client, media
+
+    client, media = asyncio.run(scenario())
+
+    assert invoked.count("ExportAuthorization") == 1
+    assert invoked.count("ImportAuthorization") == 1
+    assert media.auth_key == client.sessions[2].auth_key
+    assert started == [(2, False), (2, True)]
