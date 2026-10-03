@@ -281,7 +281,12 @@ class Session:
                 raise
             except Exception as e:
                 if not self._still_wanted():
-                    raise
+                    log.info(
+                        "Restart abandoned, the session is no longer in use - %s - %s",
+                        e.__class__.__name__,
+                        e,
+                    )
+                    return
 
                 log.warning(
                     "Restart failed, trying again in %ss - %s - %s",

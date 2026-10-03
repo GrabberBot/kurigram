@@ -125,8 +125,50 @@ def test_a_restart_stops_once_the_session_was_dropped(monkeypatch):
 
     outcome = asyncio.run(scenario())
 
-    assert outcome == "raised"
+    assert outcome == "returned"
     assert starts["n"] == 1
+
+
+def test_a_closed_client_storage_ends_the_restart_quietly(monkeypatch):
+    """Клиент остановлен, а его сессия ещё пыталась подняться — это не ошибка."""
+    fast(monkeypatch)
+
+    async def scenario():
+        fake = client()
+        session = session_for(fake)
+
+        async def closed_storage(self):
+            fake.is_connected = False
+            raise RuntimeError("Cannot operate on a closed database.")
+
+        monkeypatch.setattr(Session, "start", closed_storage)
+        task = asyncio.create_task(session.restart())
+        await task
+        return task.exception()
+
+    assert asyncio.run(scenario()) is None
+
+
+def test_a_dead_authorization_is_still_reported(monkeypatch):
+    from pyrogram.errors import AuthKeyDuplicated
+
+    fast(monkeypatch)
+
+    async def scenario():
+        fake = client()
+        session = session_for(fake)
+
+        async def duplicated(self):
+            raise AuthKeyDuplicated()
+
+        monkeypatch.setattr(Session, "start", duplicated)
+        try:
+            await session.restart()
+        except AuthKeyDuplicated:
+            return True
+        return False
+
+    assert asyncio.run(scenario())
 
 
 def test_an_unexpected_failure_while_wanted_is_retried(monkeypatch):
