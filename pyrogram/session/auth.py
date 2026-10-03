@@ -75,9 +75,16 @@ class Auth:
     async def invoke(self, data: TLObject):
         data = self.pack(data, server_time=self.client.server_time)
         await self.connection.send(data)
-        response = BytesIO(await self.connection.recv())
+        packet = await self.connection.recv()
 
-        return self.unpack(response)
+        if packet is None:
+            raise ConnectionError(f"DC{self.dc_id} closed the connection while creating an auth key")
+
+        if len(packet) == 4:
+            code = -Int.read(BytesIO(packet))
+            raise ConnectionError(f"DC{self.dc_id} sent transport error {code} while creating an auth key")
+
+        return self.unpack(BytesIO(packet))
 
     async def create(self):
         """
