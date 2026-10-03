@@ -43,8 +43,9 @@ class FileSession:
             self.in_flight -= 1
 
 
-def download(session, size_hint, parallel, monkeypatch, stop_after=None):
+def download(session, size_hint, parallel, monkeypatch, stop_after=None, per_connection=8):
     monkeypatch.setattr(Client, "DOWNLOAD_PARALLELISM", parallel)
+    monkeypatch.setattr(Client, "MEDIA_PARTS_PER_CONNECTION", per_connection)
 
     async def scenario():
         client = await offline_client()
@@ -131,3 +132,21 @@ def test_stopping_early_cancels_the_parts_requested_ahead(monkeypatch):
 
     assert got == data[: CHUNK * 2]
     assert session.in_flight == 0
+
+
+def test_a_loaded_connection_gets_no_parts_ahead(monkeypatch):
+    """Части наперёд в одном медленном соединении только отодвигали нужную по порядку."""
+    data = os.urandom(CHUNK * 8 + 7)
+    session = FileSession(data, delay=0.02)
+
+    assert download(session, len(data), 4, monkeypatch, per_connection=2) == data
+    assert session.peak <= 2
+
+
+def test_parts_cancelled_before_they_start_release_their_connection(monkeypatch):
+    data = os.urandom(CHUNK * 8)
+    session = FileSession(data, delay=0.05)
+
+    download(session, len(data), 4, monkeypatch, stop_after=1)
+
+    assert session.busy == 0

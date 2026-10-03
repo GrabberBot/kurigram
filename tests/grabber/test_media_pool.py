@@ -65,7 +65,7 @@ def test_one_connection_means_no_pool(monkeypatch):
     assert client.media_pool == {}
 
 
-def test_the_pool_grows_in_the_background_with_the_same_key(monkeypatch):
+def test_the_first_download_waits_for_the_pool_with_the_same_key(monkeypatch):
     """Прокси режет скорость на соединение: три соединения дают в 2–3 раза больше одного."""
     monkeypatch.setattr(Client, "MEDIA_CONNECTIONS", 3)
     quiet_sessions(monkeypatch)
@@ -79,7 +79,7 @@ def test_the_pool_grows_in_the_background_with_the_same_key(monkeypatch):
 
     primary, first, second = asyncio.run(scenario())
 
-    assert first == [primary]
+    assert len(first) == 3
     assert len(second) == 3
     assert second[0] is primary
     assert all(session.is_media and session.auth_key == primary.auth_key for session in second)
@@ -244,3 +244,22 @@ def test_terminate_stops_the_pool(monkeypatch):
 
     assert sorted(stopped) == ["a", "b"]
     assert client.media_pool == {}
+
+
+def test_a_failed_pool_is_not_retried_at_once(monkeypatch):
+    """Иначе каждая загрузка ждала бы прогрева пула, который прокси не даёт открыть."""
+    monkeypatch.setattr(Client, "MEDIA_CONNECTIONS", 3)
+    started = quiet_sessions(monkeypatch, fail_from=0)
+
+    async def scenario():
+        client, primary = await client_with_primary()
+        await client.get_media_sessions(2)
+        attempts = len(started)
+        began = time.monotonic()
+        sessions = await client.get_media_sessions(2)
+        return sessions, time.monotonic() - began, attempts
+
+    sessions, waited, attempts = asyncio.run(scenario())
+
+    assert len(sessions) == 1
+    assert waited < 1

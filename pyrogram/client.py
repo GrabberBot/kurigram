@@ -272,6 +272,9 @@ class Client(Methods):
     MAX_CONCURRENT_TRANSMISSIONS = 1
     DOWNLOAD_PARALLELISM = 1
     MEDIA_CONNECTIONS = 1
+    MEDIA_PARTS_PER_CONNECTION = 2
+    MEDIA_POOL_WARMUP = 10
+    MEDIA_POOL_RETRY_DELAY = 60
     KNOWN_CDN_ADDRESSES = {203: "91.105.192.100"}
     MAX_MESSAGE_CACHE_SIZE = 1000
     MAX_TOPIC_CACHE_SIZE = 1000
@@ -1203,16 +1206,19 @@ class Client(Methods):
                     scheduled = 1
 
                     def request_part(index: int) -> asyncio.Task:
-                        return self.loop.create_task(
-                            self._invoke_least_busy(
-                                media_sessions,
+                        taken = self._take_least_busy(media_sessions)
+                        task = self.loop.create_task(
+                            taken.invoke(
                                 raw.functions.upload.GetFile(
                                     location=location,
                                     offset=start_bytes + index * chunk_size,
                                     limit=chunk_size
-                                )
+                                ),
+                                sleep_threshold=30
                             )
                         )
+                        task.add_done_callback(lambda _: self._release(taken))
+                        return task
 
                     try:
                         while True:
@@ -1241,7 +1247,10 @@ class Client(Methods):
                             if len(chunk) < chunk_size or current >= total:
                                 break
 
-                            while scheduled < min(parallel_until, current + self.DOWNLOAD_PARALLELISM):
+                            while (
+                                scheduled < min(parallel_until, current + self.DOWNLOAD_PARALLELISM)
+                                and self._media_spare(media_sessions)
+                            ):
                                 ahead[scheduled] = request_part(scheduled)
                                 scheduled += 1
 
@@ -1426,45 +1435,60 @@ class Client(Methods):
             if not session._must_stay_stopped and session.auth_key == primary.auth_key
         ]
 
-        locks = self.__dict__.setdefault("_media_pool_locks", {})
-        lock = locks.setdefault(dc_id, asyncio.Lock())
+        growth = self.__dict__.setdefault("_media_pool_growth", {})
+        failed_at = self.__dict__.setdefault("_media_pool_failed_at", {})
+        task = growth.get(dc_id)
+        recently_failed = time.monotonic() - failed_at.get(dc_id, float("-inf")) < self.MEDIA_POOL_RETRY_DELAY
 
-        if len(pool) < self.MEDIA_CONNECTIONS - 1 and not lock.locked():
-            self.loop.create_task(self._grow_media_pool(dc_id, primary, lock))
+        if len(pool) < self.MEDIA_CONNECTIONS - 1 and not recently_failed and (task is None or task.done()):
+            task = growth[dc_id] = self.loop.create_task(self._grow_media_pool(dc_id, primary))
+
+        if not pool and task is not None and not task.done():
+            await asyncio.wait({task}, timeout=self.MEDIA_POOL_WARMUP)
 
         return [primary, *pool]
 
-    async def _grow_media_pool(self, dc_id: int, primary: "Session", lock: asyncio.Lock) -> None:
-        async with lock:
-            pool = self.media_pool.setdefault(dc_id, [])
+    async def _grow_media_pool(self, dc_id: int, primary: "Session") -> None:
+        pool = self.media_pool.setdefault(dc_id, [])
+        missing = self.MEDIA_CONNECTIONS - 1 - len(pool)
 
-            while len(pool) < self.MEDIA_CONNECTIONS - 1 and self.is_connected:
-                session = Session(
-                    self,
-                    dc_id,
-                    primary.server_address,
-                    primary.port,
-                    primary.auth_key,
-                    await self.storage.test_mode(),
-                    is_media=True
-                )
+        if missing <= 0 or not self.is_connected:
+            return
 
-                try:
-                    await session.start()
-                except Exception as e:
-                    log.warning("Could not open another media connection to DC%s: %s", dc_id, e)
+        test_mode = await self.storage.test_mode()
+        sessions = [
+            Session(
+                self,
+                dc_id,
+                primary.server_address,
+                primary.port,
+                primary.auth_key,
+                test_mode,
+                is_media=True
+            )
+            for _ in range(missing)
+        ]
+        results = await asyncio.gather(*(session.start() for session in sessions), return_exceptions=True)
 
-                    try:
-                        await session.stop()
-                    except Exception as stop_error:
-                        log.debug("Could not stop a media connection that failed to start: %s", stop_error)
-
-                    return
-
+        for session, result in zip(sessions, results):
+            if not isinstance(result, BaseException):
                 pool.append(session)
+                continue
+
+            log.warning("Could not open another media connection to DC%s: %s", dc_id, result)
+            self.__dict__.setdefault("_media_pool_failed_at", {})[dc_id] = time.monotonic()
+
+            try:
+                await session.stop()
+            except Exception as e:
+                log.debug("Could not stop a media connection that failed to start: %s", e)
+
+    def _media_spare(self, sessions: List["Session"]) -> bool:
+        in_flight = sum(getattr(session, "busy", 0) for session in sessions)
+        return in_flight < len(sessions) * self.MEDIA_PARTS_PER_CONNECTION
 
     @staticmethod
-    async def _invoke_least_busy(sessions: List["Session"], query: TLObject):
+    def _take_least_busy(sessions: List["Session"]) -> "Session":
         session = sessions[0]
 
         if len(sessions) > 1:
@@ -1477,11 +1501,19 @@ class Client(Methods):
             )
 
         session.busy = getattr(session, "busy", 0) + 1
+        return session
+
+    @staticmethod
+    def _release(session: "Session") -> None:
+        session.busy -= 1
+
+    async def _invoke_least_busy(self, sessions: List["Session"], query: TLObject):
+        session = self._take_least_busy(sessions)
 
         try:
             return await session.invoke(query, sleep_threshold=30)
         finally:
-            session.busy -= 1
+            self._release(session)
 
     async def get_session(
         self,
