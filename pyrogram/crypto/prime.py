@@ -80,3 +80,51 @@ def decompose(pq: int) -> int:
                 break
 
     return g
+
+
+_SAFE_DH_PRIMES = {CURRENT_DH_PRIME}
+
+
+def is_probable_prime(n: int, rounds: int = 32) -> bool:
+    if n < 2:
+        return False
+
+    for small in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if n % small == 0:
+            return n == small
+
+    d, r = n - 1, 0
+
+    while d % 2 == 0:
+        d //= 2
+        r += 1
+
+    for _ in range(rounds):
+        x = pow(randint(2, n - 2), d, n)
+
+        if x in (1, n - 1):
+            continue
+
+        for _ in range(r - 1):
+            x = pow(x, 2, n)
+
+            if x == n - 1:
+                break
+        else:
+            return False
+
+    return True
+
+
+def is_safe_dh_prime(p: int) -> bool:
+    if p in _SAFE_DH_PRIMES:
+        return True
+
+    if not 2 ** 2047 < p < 2 ** 2048:
+        return False
+
+    if not is_probable_prime(p) or not is_probable_prime((p - 1) // 2):
+        return False
+
+    _SAFE_DH_PRIMES.add(p)
+    return True

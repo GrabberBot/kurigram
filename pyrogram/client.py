@@ -50,7 +50,6 @@ from pyrogram.errors import (
     PersistentTimestampOutdated,
     SessionPasswordNeeded,
     Unauthorized,
-    VolumeLocNotFound,
 )
 from pyrogram.handlers.handler import Handler
 from pyrogram.methods import Methods
@@ -1263,25 +1262,26 @@ class Client(Methods):
                             await asyncio.gather(*ahead.values(), return_exceptions=True)
 
                 elif isinstance(r, raw.types.upload.FileCdnRedirect):
-
+                    redirect = r
                     cdn_session = await self.get_session(
-                        r.dc_id,
+                        redirect.dc_id,
                         is_cdn=True,
-                        temporary=True,
                         export_authorization=False
                     )
-                    cdn_initialized = False
+                    file_hashes: Dict[int, "raw.types.FileHash"] = {
+                        file_hash.offset: file_hash for file_hash in redirect.file_hashes
+                    }
 
-                    try:
-                        while True:
-                            cdn_query = raw.functions.upload.GetCdnFile(
-                                file_token=r.file_token,
-                                offset=offset_bytes,
+                    async def cdn_part(part_offset: int) -> bytes:
+                        for _ in range(3):
+                            query = raw.functions.upload.GetCdnFile(
+                                file_token=redirect.file_token,
+                                offset=part_offset,
                                 limit=chunk_size
                             )
 
-                            if not cdn_initialized:
-                                cdn_query = raw.functions.InvokeWithLayer(
+                            if not cdn_session.cdn_initialized:
+                                query = raw.functions.InvokeWithLayer(
                                     layer=layer,
                                     query=raw.functions.InitConnection(
                                         api_id=await self.storage.api_id(),
@@ -1291,56 +1291,82 @@ class Client(Methods):
                                         system_lang_code=self.system_lang_code,
                                         lang_pack=self.lang_pack,
                                         lang_code=self.lang_code,
-                                        query=cdn_query,
+                                        query=query,
                                     )
                                 )
 
-                            r2 = await cdn_session.invoke(cdn_query)
-                            cdn_initialized = True
+                            answer = await cdn_session.invoke(query, sleep_threshold=30)
+                            cdn_session.cdn_initialized = True
 
-                            if isinstance(r2, raw.types.upload.CdnFileReuploadNeeded):
-                                try:
-                                    await session.invoke(
-                                        raw.functions.upload.ReuploadCdnFile(
-                                            file_token=r.file_token,
-                                            request_token=r2.request_token
-                                        )
+                            if isinstance(answer, raw.types.upload.CdnFileReuploadNeeded):
+                                await session.invoke(
+                                    raw.functions.upload.ReuploadCdnFile(
+                                        file_token=redirect.file_token,
+                                        request_token=answer.request_token
                                     )
-                                except VolumeLocNotFound:
-                                    break
-                                else:
-                                    continue
-
-                            chunk = r2.bytes
-
-                            # https://core.telegram.org/cdn#decrypting-files
-                            decrypted_chunk = await self.loop.run_in_executor(
-                                self.executor,
-                                aes.ctr256_decrypt,
-                                chunk,
-                                r.encryption_key,
-                                bytearray(r.encryption_iv[:-4] + (offset_bytes // 16).to_bytes(4, "big"))
-                            )
-
-                            hashes = await session.invoke(
-                                raw.functions.upload.GetCdnFileHashes(
-                                    file_token=r.file_token,
-                                    offset=offset_bytes
                                 )
+                                continue
+
+                            return answer.bytes
+
+                        raise TimeoutError(f"DC{redirect.dc_id} kept asking to reupload a CDN file")
+
+                    async def verified(part_offset: int, encrypted: bytes) -> bytes:
+                        if not encrypted:
+                            return encrypted
+
+                        # https://core.telegram.org/cdn#decrypting-files
+                        decrypted = await self.loop.run_in_executor(
+                            self.executor,
+                            aes.ctr256_decrypt,
+                            encrypted,
+                            redirect.encryption_key,
+                            bytearray(redirect.encryption_iv[:-4] + (part_offset // 16).to_bytes(4, "big"))
+                        )
+
+                        # https://core.telegram.org/cdn#verifying-files
+                        position = part_offset
+
+                        while position < part_offset + len(decrypted):
+                            if position not in file_hashes:
+                                for file_hash in await session.invoke(
+                                    raw.functions.upload.GetCdnFileHashes(
+                                        file_token=redirect.file_token,
+                                        offset=position
+                                    )
+                                ):
+                                    file_hashes[file_hash.offset] = file_hash
+
+                            file_hash = file_hashes.get(position)
+
+                            if file_hash is None:
+                                raise CDNFileHashMismatch(f"No CDN file hash for offset {position}")
+
+                            piece = decrypted[position - part_offset:position - part_offset + file_hash.limit]
+
+                            CDNFileHashMismatch.check(
+                                file_hash.hash == sha256(piece).digest(),
+                                "file_hash.hash == sha256(piece).digest()"
                             )
 
-                            # https://core.telegram.org/cdn#verifying-files
-                            def _check_all_hashes():
-                                for i, h in enumerate(hashes):
-                                    cdn_chunk = decrypted_chunk[h.limit * i: h.limit * (i + 1)]
-                                    CDNFileHashMismatch.check(
-                                        h.hash == sha256(cdn_chunk).digest(),
-                                        "h.hash == sha256(cdn_chunk).digest()"
-                                    )
+                            position += file_hash.limit
 
-                            await self.loop.run_in_executor(self.executor, _check_all_hashes)
+                        return decrypted
 
-                            yield decrypted_chunk
+                    start_bytes = offset_bytes
+                    known_parts = (
+                        -(-(file_size - start_bytes) // chunk_size)
+                        if file_size > start_bytes
+                        else 0
+                    )
+                    parallel_until = min(known_parts, total) if self.DOWNLOAD_PARALLELISM > 1 else 0
+                    ahead: Dict[int, asyncio.Task] = {}
+                    scheduled = 1
+                    chunk = await cdn_part(offset_bytes)
+
+                    try:
+                        while True:
+                            yield await verified(offset_bytes, chunk)
 
                             current += 1
                             offset_bytes += chunk_size
@@ -1360,10 +1386,23 @@ class Client(Methods):
 
                             if len(chunk) < chunk_size or current >= total:
                                 break
-                    except Exception as e:
-                        raise e
+
+                            while scheduled < min(parallel_until, current + self.DOWNLOAD_PARALLELISM):
+                                ahead[scheduled] = self.loop.create_task(
+                                    cdn_part(start_bytes + scheduled * chunk_size)
+                                )
+                                scheduled += 1
+
+                            if current in ahead:
+                                chunk = await ahead.pop(current)
+                            else:
+                                chunk = await cdn_part(offset_bytes)
                     finally:
-                        await cdn_session.stop()
+                        for task in ahead.values():
+                            task.cancel()
+
+                        if ahead:
+                            await asyncio.gather(*ahead.values(), return_exceptions=True)
             except Exception as e:
                 raise e
 

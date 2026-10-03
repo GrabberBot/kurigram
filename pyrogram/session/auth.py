@@ -119,15 +119,8 @@ class Auth:
                 log.debug("Got ResPq: %s", res_pq.server_nonce)
                 log.debug("Server public key fingerprints: %s", res_pq.server_public_key_fingerprints)
 
-                for i in res_pq.server_public_key_fingerprints:
-                    if i in rsa.server_public_keys:
-                        log.debug("Using fingerprint: %s", i)
-                        public_key_fingerprint = i
-                        break
-                    else:
-                        log.debug("Fingerprint unknown: %s", i)
-                else:
-                    raise Exception("Public key not found")
+                public_key_fingerprint = rsa.pick_fingerprint(res_pq.server_public_key_fingerprints)
+                log.debug("Using fingerprint: %s", public_key_fingerprint)
 
                 # Step 3
                 pq = int.from_bytes(res_pq.pq, "big")
@@ -141,19 +134,17 @@ class Auth:
                 server_nonce = res_pq.server_nonce
                 new_nonce = int.from_bytes(urandom(32), "little", signed=True)
 
-                data = raw.types.PQInnerData(
+                data = raw.types.PQInnerDataDc(
                     pq=res_pq.pq,
                     p=p.to_bytes(4, "big"),
                     q=q.to_bytes(4, "big"),
                     nonce=nonce,
                     server_nonce=server_nonce,
                     new_nonce=new_nonce,
+                    dc=self.dc_id + 10000 if self.test_mode else self.dc_id,
                 ).write()
 
-                sha = sha1(data).digest()
-                padding = urandom(- (len(data) + len(sha)) % 255)
-                data_with_hash = sha + data + padding
-                encrypted_data = rsa.encrypt(data_with_hash, public_key_fingerprint)
+                encrypted_data = rsa.encrypt_inner_data(data, public_key_fingerprint)
 
                 log.debug("Done encrypt data with RSA")
 
@@ -240,7 +231,8 @@ class Auth:
                 # Security checks
                 #######################
 
-                SecurityCheckMismatch.check(dh_prime == prime.CURRENT_DH_PRIME, "dh_prime == prime.CURRENT_DH_PRIME")
+                safe_prime = await self.loop.run_in_executor(None, prime.is_safe_dh_prime, dh_prime)
+                SecurityCheckMismatch.check(safe_prime, "prime.is_safe_dh_prime(dh_prime)")
                 log.debug("DH parameters check: OK")
 
                 # https://core.telegram.org/mtproto/security_guidelines#g-a-and-g-b-validation

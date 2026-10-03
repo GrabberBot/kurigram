@@ -118,6 +118,7 @@ class Session:
         self.test_mode = test_mode
         self.is_media = is_media
         self.is_cdn = is_cdn
+        self.cdn_initialized = False
 
         self.connection: Optional[Connection] = None
 
@@ -199,6 +200,7 @@ class Session:
 
         await self._set_state(SessionState.STARTING)
 
+        self.cdn_initialized = False
         self.connection = self.client.connection_factory(
             dc_id=self.dc_id,
             server_address=self.server_address,

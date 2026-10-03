@@ -57,6 +57,11 @@ class Terminate:
 
         self.media_sessions.clear()
 
+        for dc_session in tuple(self.sessions.values()):
+            await dc_session.stop()
+
+        self.sessions.clear()
+
         self.updates_watchdog_event.set()
 
         if self.updates_watchdog_task is not None:

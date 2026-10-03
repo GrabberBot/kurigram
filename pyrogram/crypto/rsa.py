@@ -250,6 +250,19 @@ server_public_keys = {
     )
 }
 
+LEGACY_FINGERPRINTS = frozenset(server_public_keys)
+
+PRODUCTION_PUBLIC_KEY = (
+    "-----BEGIN RSA PUBLIC KEY-----\n"
+    "MIIBCgKCAQEA6LszBcC1LGzyr992NzE0ieY+BSaOW622Aa9Bd4ZHLl+TuFQ4lo4g\n"
+    "5nKaMBwK/BIb9xUfg0Q29/2mgIR6Zr9krM7HjuIcCzFvDtr+L0GQjae9H0pRB2OO\n"
+    "62cECs5HKhT5DZ98K33vmWiLowc621dQuwKWSQKjWf50XYFw42h21P2KXUGyp2y/\n"
+    "+aEyZ+uVgLLQbRA1dEjSDZ2iGRy12Mk5gpYc397aYp438fsJoHIgJ2lgMv5h7WY9\n"
+    "t6N/byY9Nw9p21Og3AoXSL2q/2IJ1WRUhebgAdGVMlV1fkuOQoEzR7EdpqtQD9Cs\n"
+    "5+bfo3Nhmcyvk5ftB0WkJ9z6bNZ7yxrP8wIDAQAB\n"
+    "-----END RSA PUBLIC KEY-----"
+)
+
 
 def encrypt(data: bytes, fingerprint: int) -> bytes:
     return pow(
@@ -257,6 +270,53 @@ def encrypt(data: bytes, fingerprint: int) -> bytes:
         server_public_keys[fingerprint].e,
         server_public_keys[fingerprint].m
     ).to_bytes(256, "big")
+
+
+def encrypt_padded(data: bytes, fingerprint: int) -> bytes:
+    from hashlib import sha256
+    from os import urandom
+
+    from pyrogram.crypto import aes
+
+    if len(data) > 144:
+        raise ValueError(f"RSA_PAD takes at most 144 bytes, got {len(data)}")
+
+    key = server_public_keys[fingerprint]
+    data_with_padding = data + urandom(192 - len(data))
+    data_pad_reversed = data_with_padding[::-1]
+
+    while True:
+        temp_key = urandom(32)
+        data_with_hash = data_pad_reversed + sha256(temp_key + data_with_padding).digest()
+        aes_encrypted = aes.ige256_encrypt(data_with_hash, temp_key, bytes(32))
+        temp_key_xor = bytes(a ^ b for a, b in zip(temp_key, sha256(aes_encrypted).digest()))
+        key_aes_encrypted = temp_key_xor + aes_encrypted
+
+        if int.from_bytes(key_aes_encrypted, "big") < key.m:
+            break
+
+    return pow(int.from_bytes(key_aes_encrypted, "big"), key.e, key.m).to_bytes(256, "big")
+
+
+def encrypt_inner_data(data: bytes, fingerprint: int) -> bytes:
+    if fingerprint not in LEGACY_FINGERPRINTS:
+        return encrypt_padded(data, fingerprint)
+
+    from hashlib import sha1
+    from os import urandom
+
+    sha = sha1(data).digest()
+    padding = urandom(- (len(data) + len(sha)) % 255)
+    return encrypt(sha + data + padding, fingerprint)
+
+
+def pick_fingerprint(offered) -> int:
+    known = [fp for fp in offered if fp in server_public_keys]
+
+    if not known:
+        raise ValueError("Public key not found")
+
+    return min(known, key=lambda fp: fp in LEGACY_FINGERPRINTS)
 
 
 def _der_length(data: bytes, offset: int) -> tuple[int, int]:
@@ -310,3 +370,6 @@ def add_public_key(pem: str) -> int:
     key_fingerprint = fingerprint(key)
     server_public_keys[key_fingerprint] = key
     return key_fingerprint
+
+
+add_public_key(PRODUCTION_PUBLIC_KEY)
