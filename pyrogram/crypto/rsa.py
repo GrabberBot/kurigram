@@ -257,3 +257,56 @@ def encrypt(data: bytes, fingerprint: int) -> bytes:
         server_public_keys[fingerprint].e,
         server_public_keys[fingerprint].m
     ).to_bytes(256, "big")
+
+
+def _der_length(data: bytes, offset: int) -> tuple[int, int]:
+    first = data[offset]
+    offset += 1
+    if first < 0x80:
+        return first, offset
+
+    size = first & 0x7F
+    return int.from_bytes(data[offset:offset + size], "big"), offset + size
+
+
+def _der_integer(data: bytes, offset: int) -> tuple[int, int]:
+    if data[offset] != 0x02:
+        raise ValueError("Expected a DER INTEGER")
+
+    length, offset = _der_length(data, offset + 1)
+    return int.from_bytes(data[offset:offset + length], "big"), offset + length
+
+
+def parse_pem(pem: str) -> PublicKey:
+    body = "".join(
+        line.strip() for line in pem.strip().splitlines()
+        if line.strip() and not line.startswith("-----")
+    )
+    der = __import__("base64").b64decode(body)
+
+    if der[0] != 0x30:
+        raise ValueError("Expected a DER SEQUENCE")
+
+    _, offset = _der_length(der, 1)
+    modulus, offset = _der_integer(der, offset)
+    exponent, _ = _der_integer(der, offset)
+    return PublicKey(modulus, exponent)
+
+
+def fingerprint(key: PublicKey) -> int:
+    from hashlib import sha1
+
+    from pyrogram.raw.core.primitives import Bytes
+
+    def to_bytes(value: int) -> bytes:
+        return value.to_bytes((value.bit_length() + 7) // 8, "big")
+
+    serialized = Bytes(to_bytes(key.m)) + Bytes(to_bytes(key.e))
+    return int.from_bytes(sha1(serialized).digest()[-8:], "little", signed=True)
+
+
+def add_public_key(pem: str) -> int:
+    key = parse_pem(pem)
+    key_fingerprint = fingerprint(key)
+    server_public_keys[key_fingerprint] = key
+    return key_fingerprint

@@ -38,7 +38,8 @@ from typing import AsyncIterator, Callable, List, Optional, Type, Union
 import pyrogram
 from pyrogram import __license__, __version__, enums, raw, utils
 from pyrogram.connection.transport.tcp import ProxyDict
-from pyrogram.crypto import aes
+from pyrogram.crypto import aes, rsa
+from pyrogram.raw.all import layer
 from pyrogram.errors import (
     AuthBytesInvalid,
     AuthTokenExpired,
@@ -1223,17 +1224,39 @@ class Client(Methods):
 
                 elif isinstance(r, raw.types.upload.FileCdnRedirect):
 
-                    cdn_session = await self.get_session(dc_id, is_cdn=True, temporary=True)
+                    cdn_session = await self.get_session(
+                        r.dc_id,
+                        is_cdn=True,
+                        temporary=True,
+                        export_authorization=False
+                    )
+                    cdn_initialized = False
 
                     try:
                         while True:
-                            r2 = await cdn_session.invoke(
-                                raw.functions.upload.GetCdnFile(
-                                    file_token=r.file_token,
-                                    offset=offset_bytes,
-                                    limit=chunk_size
-                                )
+                            cdn_query = raw.functions.upload.GetCdnFile(
+                                file_token=r.file_token,
+                                offset=offset_bytes,
+                                limit=chunk_size
                             )
+
+                            if not cdn_initialized:
+                                cdn_query = raw.functions.InvokeWithLayer(
+                                    layer=layer,
+                                    query=raw.functions.InitConnection(
+                                        api_id=await self.storage.api_id(),
+                                        app_version=self.app_version,
+                                        device_model=self.device_model,
+                                        system_version=self.system_version,
+                                        system_lang_code=self.system_lang_code,
+                                        lang_pack=self.lang_pack,
+                                        lang_code=self.lang_code,
+                                        query=cdn_query,
+                                    )
+                                )
+
+                            r2 = await cdn_session.invoke(cdn_query)
+                            cdn_initialized = True
 
                             if isinstance(r2, raw.types.upload.CdnFileReuploadNeeded):
                                 try:
@@ -1377,6 +1400,9 @@ class Client(Methods):
             server_address = server_address or dc_option.ip_address
             port = port or dc_option.port
 
+        if is_cdn:
+            await self.load_cdn_keys()
+
         if is_media:
             auth_key = (await self.get_session(dc_id)).auth_key
         else:
@@ -1398,38 +1424,58 @@ class Client(Methods):
             port,
             auth_key,
             await self.storage.test_mode(),
-            is_media=is_media
+            is_media=is_media,
+            is_cdn=is_cdn
         )
 
         if not temporary:
             sessions[dc_id] = session
 
-        await session.start()
+        try:
+            await session.start()
 
-        if not is_current_dc and export_authorization:
-            for _ in range(3):
-                exported_auth = await self.invoke(
-                    raw.functions.auth.ExportAuthorization(
-                        dc_id=dc_id
-                    )
-                )
-
-                try:
-                    await session.invoke(
-                        raw.functions.auth.ImportAuthorization(
-                            id=exported_auth.id,
-                            bytes=exported_auth.bytes
+            if not is_current_dc and export_authorization and not is_cdn:
+                for _ in range(3):
+                    exported_auth = await self.invoke(
+                        raw.functions.auth.ExportAuthorization(
+                            dc_id=dc_id
                         )
                     )
-                except AuthBytesInvalid:
-                    continue
+
+                    try:
+                        await session.invoke(
+                            raw.functions.auth.ImportAuthorization(
+                                id=exported_auth.id,
+                                bytes=exported_auth.bytes
+                            )
+                        )
+                    except AuthBytesInvalid:
+                        continue
+                    else:
+                        break
                 else:
-                    break
-            else:
+                    raise AuthBytesInvalid
+        except BaseException:
+            if not temporary and sessions.get(dc_id) is session:
+                sessions.pop(dc_id, None)
+
+            try:
                 await session.stop()
-                raise AuthBytesInvalid
+            except Exception as e:
+                log.debug("Could not stop a session that failed to start: %s", e)
+
+            raise
 
         return session
+
+    async def load_cdn_keys(self) -> None:
+        config = await self.invoke(raw.functions.help.GetCdnConfig())
+
+        for public_key in config.public_keys:
+            try:
+                rsa.add_public_key(public_key.public_key)
+            except ValueError as e:
+                log.warning("Skipping an unreadable CDN key for DC%s: %s", public_key.dc_id, e)
 
     async def get_dc_option(
         self,

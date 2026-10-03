@@ -20,6 +20,8 @@ import asyncio
 import logging
 from typing import Optional, Type, Union
 
+from python_socks import ProxyError
+
 from pyrogram import utils
 
 from .transport import TCP, TCPAbridged
@@ -66,7 +68,7 @@ class Connection:
             try:
                 log.info("Connecting...")
                 await self.protocol.connect((self.server_address, self.port))
-            except OSError as e:
+            except (OSError, ProxyError) as e:
                 log.warning("Unable to connect due to network issues: %s", e)
                 await self.protocol.close()
                 await asyncio.sleep(1)

@@ -89,6 +89,7 @@ class Session:
     RETRY_DELAY = 1
     STORED_MSG_IDS_MAX_SIZE = 1000 * 2
     CRYPTO_EXECUTOR_WORKERS = 1
+    RESTART_RETRY_DELAY = 5
     MAX_CONSECUTIVE_IGNORED = 30
 
     def __init__(
@@ -273,8 +274,43 @@ class Session:
             if self.stored_msg_ids:
                self.recent_msg_ids = self.stored_msg_ids[:30]
 
-            await self.stop()
-            await self.start()
+            try:
+                await self.stop()
+                await self.start()
+            except (AuthKeyDuplicated, Unauthorized):
+                raise
+            except Exception as e:
+                if not self._still_wanted():
+                    raise
+
+                log.warning(
+                    "Restart failed, trying again in %ss - %s - %s",
+                    self.RESTART_RETRY_DELAY,
+                    e.__class__.__name__,
+                    e,
+                )
+                self.client.loop.create_task(self._restart_later())
+
+    async def _restart_later(self):
+        await asyncio.sleep(self.RESTART_RETRY_DELAY)
+
+        if self._still_wanted():
+            await self.restart()
+
+    def _still_wanted(self) -> bool:
+        client = self.client
+
+        if not getattr(client, "is_connected", False):
+            return False
+
+        if self is getattr(client, "session", None):
+            return True
+
+        return any(
+            self is session
+            for registry in (getattr(client, "media_sessions", {}), getattr(client, "sessions", {}))
+            for session in registry.values()
+        )
 
     async def handle_packet(self, packet):
         try:
