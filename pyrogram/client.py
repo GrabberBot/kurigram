@@ -275,6 +275,7 @@ class Client(Methods):
     MEDIA_PARTS_PER_CONNECTION = 2
     MEDIA_POOL_WARMUP = 10
     MEDIA_POOL_RETRY_DELAY = 60
+    FILE_PART_TIMEOUT = 300
     KNOWN_CDN_ADDRESSES = {203: "91.105.192.100"}
     MAX_MESSAGE_CACHE_SIZE = 1000
     MAX_TOPIC_CACHE_SIZE = 1000
@@ -1214,7 +1215,8 @@ class Client(Methods):
                                     offset=start_bytes + index * chunk_size,
                                     limit=chunk_size
                                 ),
-                                sleep_threshold=30
+                                sleep_threshold=30,
+                                timeout=self.FILE_PART_TIMEOUT
                             )
                         )
                         task.add_done_callback(lambda _: self._release(taken))
@@ -1312,7 +1314,7 @@ class Client(Methods):
                                     )
                                 )
 
-                            answer = await cdn_session.invoke(query, sleep_threshold=30)
+                            answer = await cdn_session.invoke(query, sleep_threshold=30, timeout=self.FILE_PART_TIMEOUT)
                             cdn_session.cdn_initialized = True
 
                             if isinstance(answer, raw.types.upload.CdnFileReuploadNeeded):
@@ -1511,7 +1513,7 @@ class Client(Methods):
         session = self._take_least_busy(sessions)
 
         try:
-            return await session.invoke(query, sleep_threshold=30)
+            return await session.invoke(query, sleep_threshold=30, timeout=self.FILE_PART_TIMEOUT)
         finally:
             self._release(session)
 

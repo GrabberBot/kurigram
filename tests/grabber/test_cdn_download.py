@@ -360,3 +360,21 @@ def test_a_redirect_in_the_middle_continues_from_the_cdn(monkeypatch, parallel):
         for q in cdn.session.queries
     )
     assert cdn_offsets[0] == CHUNK * 2
+
+
+def test_cdn_parts_wait_long_too(monkeypatch):
+    monkeypatch.setattr(Client, "FILE_PART_TIMEOUT", 321)
+    cdn = Cdn(os.urandom(CHUNK * 3 + 1))
+    seen = []
+    original = cdn.session.invoke
+
+    async def invoke(query, *args, **kwargs):
+        seen.append(kwargs.get("timeout"))
+        return await original(query, *args, **kwargs)
+
+    cdn.session.invoke = invoke
+
+    data, _ = download(cdn, monkeypatch)
+
+    assert data == cdn.data
+    assert seen and set(seen) == {321}

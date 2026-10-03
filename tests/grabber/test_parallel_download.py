@@ -150,3 +150,23 @@ def test_parts_cancelled_before_they_start_release_their_connection(monkeypatch)
     download(session, len(data), 4, monkeypatch, stop_after=1)
 
     assert session.busy == 0
+
+
+class Recording(FileSession):
+    def __init__(self, data):
+        super().__init__(data)
+        self.timeouts = []
+
+    async def invoke(self, query, *args, **kwargs):
+        self.timeouts.append(kwargs.get("timeout"))
+        return await super().invoke(query, *args, **kwargs)
+
+
+def test_file_parts_wait_long_instead_of_being_sent_again(monkeypatch):
+    """Ответ в очереди медленного соединения не успевал за 60 с, часть запрашивалась заново, и мегабайт шёл дважды."""
+    monkeypatch.setattr(Client, "FILE_PART_TIMEOUT", 321)
+    data = os.urandom(CHUNK * 4 + 5)
+    session = Recording(data)
+
+    assert download(session, len(data), 3, monkeypatch) == data
+    assert session.timeouts and set(session.timeouts) == {321}
