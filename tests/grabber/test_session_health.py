@@ -308,3 +308,45 @@ def test_parallel_downloads_share_one_new_media_session(monkeypatch):
     assert len(created) == 1
     assert len({id(item) for item in sessions}) == 1
     assert cached == {2: sessions[0]}
+
+
+def test_a_retry_waits_for_the_restarted_session_instead_of_a_dead_one(monkeypatch):
+    """Повтор уходил в закрытое соединение и ждал полный таймаут вхолостую."""
+    monkeypatch.setattr(Session, "RETRY_DELAY", 0)
+    attempts = []
+
+    async def scenario():
+        session = started_session()
+        answer = object()
+
+        async def send(query, wait_response=True, timeout=None):
+            attempts.append(session.is_started.is_set())
+            if len(attempts) == 1:
+                session.is_started.clear()
+
+                async def come_back():
+                    await REAL_SLEEP(0.02)
+                    session.is_started.set()
+
+                asyncio.get_running_loop().create_task(come_back())
+                raise TimeoutError("Request timed out")
+            return answer
+
+        session.send = send
+        return await session.invoke(raw.functions.help.GetConfig()), answer
+
+    got, answer = asyncio.run(scenario())
+
+    assert got is answer
+    assert attempts == [True, True]
+
+
+def test_sending_through_a_stopped_session_fails_at_once():
+    async def scenario():
+        session = Session(client(), 2, "149.154.167.51", 443, os.urandom(256), False)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="not running"):
+            await session.send(raw.functions.help.GetConfig())
+        return time.monotonic() - started
+
+    assert asyncio.run(scenario()) < 1

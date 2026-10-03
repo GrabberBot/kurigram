@@ -622,6 +622,9 @@ class Session:
     async def send(
         self, data: TLObject, wait_response: bool = True, timeout: float = WAIT_TIMEOUT
     ):
+        if self._state in (SessionState.STOPPED, SessionState.STOPPING):
+            raise TimeoutError(f"{self} is not running")
+
         message = await self.msg_factory.create(data)
         msg_id = message.msg_id
 
@@ -700,14 +703,9 @@ class Session:
 
         query_name = ".".join(inner_query.QUALNAME.split(".")[1:])
 
-        try:
-            await asyncio.wait_for(self.is_started.wait(), self.WAIT_TIMEOUT)
-        except asyncio.TimeoutError as e:
-            raise TimeoutError(
-                f'Waited {self.WAIT_TIMEOUT}s to invoke "{query_name}", and {self} is not started'
-            ) from e
-
         for attempt in range(1, retries + 1):
+            await self._wait_started(query_name)
+
             try:
                 return await self.send(query, timeout=timeout)
             except (FloodWait, FloodPremiumWait) as e:
@@ -732,6 +730,14 @@ class Session:
                 await asyncio.sleep(retry_delay)
 
         raise TimeoutError(f'Failed to invoke "{query_name}" after {retries} retries')
+
+    async def _wait_started(self, query_name: str) -> None:
+        try:
+            await asyncio.wait_for(self.is_started.wait(), self.WAIT_TIMEOUT)
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(
+                f'Waited {self.WAIT_TIMEOUT}s to invoke "{query_name}", and {self} is not started'
+            ) from e
 
     def __str__(self) -> str:
         return f"Session(dc_id={self.dc_id}, test_mode={self.test_mode}, is_media={self.is_media}, is_cdn={self.is_cdn}, state={self._state.name})"
