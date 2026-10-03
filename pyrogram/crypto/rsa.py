@@ -250,7 +250,15 @@ server_public_keys = {
     )
 }
 
-LEGACY_FINGERPRINTS = frozenset(server_public_keys)
+LEGACY_FINGERPRINTS = frozenset(
+    {
+        0xc3b42b026ce86b21 - (1 << 64),
+        0x10bc35f3509f7b7a5 - (1 << 64),
+        0x115ae5fa8b5529542 - (1 << 64),
+        0xaeae98e13cd7f94f - (1 << 64),
+        0x15a181b2235057d98 - (1 << 64),
+    }
+)
 
 PRODUCTION_PUBLIC_KEY = (
     "-----BEGIN RSA PUBLIC KEY-----\n"

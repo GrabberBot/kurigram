@@ -200,3 +200,21 @@ def test_a_failed_handshake_names_the_step_and_the_key(own_key):
 
     with pytest.raises(ConnectionError, match=r"at req_DH_params, offered keys .* used -?\d+ \(current\)"):
         asyncio.run(auth.create())
+
+
+@pytest.mark.parametrize("fingerprint", [0x995effd323b5db80 - (1 << 64), 0xc884b3e62d09e5c5 - (1 << 64), 0xbb27580fd5b01626 - (1 << 64)])
+def test_builtin_cdn_keys_get_the_new_padding(monkeypatch, fingerprint):
+    """Ключ DC201 встроен в pyrogram; старая схема для него давала -404 на req_DH_params."""
+    padded = []
+    monkeypatch.setattr(rsa, "encrypt_padded", lambda data, fp: padded.append(fp) or b"x" * 256)
+    monkeypatch.setattr(rsa, "encrypt", lambda data, fp: pytest.fail("old padding used for a CDN key"))
+
+    rsa.encrypt_inner_data(os.urandom(96), fingerprint)
+
+    assert padded == [fingerprint]
+    assert fingerprint not in rsa.LEGACY_FINGERPRINTS
+
+
+def test_only_the_main_server_keys_keep_the_old_padding():
+    assert len(rsa.LEGACY_FINGERPRINTS) == 5
+    assert rsa.LEGACY_FINGERPRINTS <= set(rsa.server_public_keys)

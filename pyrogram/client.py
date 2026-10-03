@@ -1257,6 +1257,9 @@ class Client(Methods):
                                     )
                                 )
 
+                            if isinstance(r, raw.types.upload.FileCdnRedirect):
+                                break
+
                             if not isinstance(r, raw.types.upload.File):
                                 raise ValueError(f"Unexpected answer while downloading a file: {type(r).__name__}")
                     finally:
@@ -1266,7 +1269,7 @@ class Client(Methods):
                         if ahead:
                             await asyncio.gather(*ahead.values(), return_exceptions=True)
 
-                elif isinstance(r, raw.types.upload.FileCdnRedirect):
+                if isinstance(r, raw.types.upload.FileCdnRedirect):
                     redirect = r
                     cdn_session = await self.get_session(
                         redirect.dc_id,
@@ -1358,7 +1361,7 @@ class Client(Methods):
 
                         return decrypted
 
-                    start_bytes = offset_bytes
+                    start_bytes = offset_bytes - current * chunk_size
                     known_parts = (
                         -(-(file_size - start_bytes) // chunk_size)
                         if file_size > start_bytes
@@ -1366,7 +1369,7 @@ class Client(Methods):
                     )
                     parallel_until = min(known_parts, total) if self.DOWNLOAD_PARALLELISM > 1 else 0
                     ahead: Dict[int, asyncio.Task] = {}
-                    scheduled = 1
+                    scheduled = current + 1
                     chunk = await cdn_part(offset_bytes)
 
                     try:

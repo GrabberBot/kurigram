@@ -327,3 +327,36 @@ def test_a_cdn_dc_missing_from_the_config_falls_back_to_its_known_address():
 
     assert found.ip_address == "91.105.192.100"
     assert found.cdn
+
+
+class SwitchingMaster(FakeMaster):
+    def __init__(self, cdn, switch_at):
+        super().__init__(cdn)
+        self.switch_at = switch_at
+
+    async def invoke(self, query, *args, **kwargs):
+        if isinstance(query, raw.functions.upload.GetFile) and query.offset < self.switch_at:
+            self.queries.append(query)
+            await REAL_SLEEP(0.01)
+            return raw.types.upload.File(
+                type=raw.types.storage.FilePartial(),
+                mtime=0,
+                bytes=self.cdn.data[query.offset:query.offset + query.limit],
+            )
+        return await super().invoke(query, *args, **kwargs)
+
+
+@pytest.mark.parametrize("parallel", [1, 3])
+def test_a_redirect_in_the_middle_continues_from_the_cdn(monkeypatch, parallel):
+    """Популярный файл уходит на CDN посреди скачивания; раньше это был ValueError и потерянный файл."""
+    cdn = Cdn(os.urandom(CHUNK * 5 + 99))
+    cdn.master = SwitchingMaster(cdn, CHUNK * 2)
+
+    data, _ = download(cdn, monkeypatch, parallel=parallel)
+
+    assert data == cdn.data
+    cdn_offsets = sorted(
+        (q if isinstance(q, raw.functions.upload.GetCdnFile) else q.query.query).offset
+        for q in cdn.session.queries
+    )
+    assert cdn_offsets[0] == CHUNK * 2
