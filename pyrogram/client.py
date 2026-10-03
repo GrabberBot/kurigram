@@ -33,7 +33,7 @@ from importlib import import_module
 from io import BytesIO, StringIO
 from mimetypes import MimeTypes
 from pathlib import Path
-from typing import AsyncIterator, Callable, List, Optional, Type, Union
+from typing import AsyncIterator, Callable, Dict, List, Optional, Type, Union
 
 import pyrogram
 from pyrogram import __license__, __version__, enums, raw, utils
@@ -270,6 +270,7 @@ class Client(Methods):
     UPDATES_WATCHDOG_INTERVAL = 15 * 60
 
     MAX_CONCURRENT_TRANSMISSIONS = 1
+    DOWNLOAD_PARALLELISM = 1
     MAX_MESSAGE_CACHE_SIZE = 1000
     MAX_TOPIC_CACHE_SIZE = 1000
 
@@ -1187,40 +1188,79 @@ class Client(Methods):
                 )
 
                 if isinstance(r, raw.types.upload.File):
-                    while True:
-                        chunk = r.bytes
+                    start_bytes = offset_bytes
+                    known_parts = (
+                        -(-(file_size - start_bytes) // chunk_size)
+                        if file_size > start_bytes
+                        else 0
+                    )
+                    parallel_until = min(known_parts, total) if self.DOWNLOAD_PARALLELISM > 1 else 0
+                    ahead: Dict[int, asyncio.Task] = {}
+                    scheduled = 1
 
-                        yield chunk
-
-                        current += 1
-                        offset_bytes += chunk_size
-
-                        if progress:
-                            func = functools.partial(
-                                progress,
-                                min(offset_bytes, file_size)
-                                if file_size != 0
-                                else offset_bytes,
-                                file_size,
-                                *progress_args
+                    def request_part(index: int) -> asyncio.Task:
+                        return self.loop.create_task(
+                            session.invoke(
+                                raw.functions.upload.GetFile(
+                                    location=location,
+                                    offset=start_bytes + index * chunk_size,
+                                    limit=chunk_size
+                                ),
+                                sleep_threshold=30
                             )
-
-                            if inspect.iscoroutinefunction(progress):
-                                await func()
-                            else:
-                                await self.loop.run_in_executor(self.executor, func)
-
-                        if len(chunk) < chunk_size or current >= total:
-                            break
-
-                        r = await session.invoke(
-                            raw.functions.upload.GetFile(
-                                location=location,
-                                offset=offset_bytes,
-                                limit=chunk_size
-                            ),
-                            sleep_threshold=30
                         )
+
+                    try:
+                        while True:
+                            chunk = r.bytes
+
+                            yield chunk
+
+                            current += 1
+                            offset_bytes += chunk_size
+
+                            if progress:
+                                func = functools.partial(
+                                    progress,
+                                    min(offset_bytes, file_size)
+                                    if file_size != 0
+                                    else offset_bytes,
+                                    file_size,
+                                    *progress_args
+                                )
+
+                                if inspect.iscoroutinefunction(progress):
+                                    await func()
+                                else:
+                                    await self.loop.run_in_executor(self.executor, func)
+
+                            if len(chunk) < chunk_size or current >= total:
+                                break
+
+                            while scheduled < min(parallel_until, current + self.DOWNLOAD_PARALLELISM):
+                                ahead[scheduled] = request_part(scheduled)
+                                scheduled += 1
+
+                            if current in ahead:
+                                r = await ahead.pop(current)
+                            else:
+                                r = await session.invoke(
+                                    raw.functions.upload.GetFile(
+                                        location=location,
+                                        offset=offset_bytes,
+                                        limit=chunk_size
+                                    ),
+                                    sleep_threshold=30
+                                )
+
+                            if not isinstance(r, raw.types.upload.File):
+                                raise ValueError(f"Unexpected answer while downloading a file: {type(r).__name__}")
+                    finally:
+                        for task in ahead.values():
+                            task.cancel()
+
+                        if ahead:
+                            await asyncio.gather(*ahead.values(), return_exceptions=True)
 
                 elif isinstance(r, raw.types.upload.FileCdnRedirect):
 
