@@ -170,3 +170,33 @@ def test_the_inner_data_names_the_dc(own_key, dc_id, test_mode, expected):
     assert isinstance(inner, raw.types.PQInnerDataDc)
     assert inner.dc == expected
     assert {int.from_bytes(inner.p, "big"), int.from_bytes(inner.q, "big")} == {1000003, 1000033}
+
+
+def test_a_cdn_key_is_preferred_when_the_cdn_also_offers_a_main_key(own_key):
+    fingerprint = own_key[0]
+    rsa.cdn_fingerprints.add(fingerprint)
+
+    assert rsa.pick_fingerprint([PRODUCTION, LEGACY, fingerprint]) == fingerprint
+    assert rsa.describe_key(fingerprint) == "cdn"
+    assert rsa.describe_key(PRODUCTION) == "current"
+    assert rsa.describe_key(LEGACY) == "legacy"
+
+
+def test_a_failed_handshake_names_the_step_and_the_key(own_key):
+    """Без шага и ключа в тексте ошибки -404 от CDN было не разобрать."""
+    fingerprint = own_key[0]
+    server = Server(fingerprint)
+    auth = Auth.__new__(Auth)
+    auth.dc_id = 201
+    auth.server_address = "91.108.56.181"
+    auth.port = 443
+    auth.test_mode = False
+    auth.proxy = None
+    auth.protocol_factory = None
+    auth.loop = None
+    auth.client = SimpleNamespace(server_time=0.0)
+    auth.connection_factory = lambda **kwargs: server
+    auth.MAX_RETRIES = 0
+
+    with pytest.raises(ConnectionError, match=r"at req_DH_params, offered keys .* used -?\d+ \(current\)"):
+        asyncio.run(auth.create())

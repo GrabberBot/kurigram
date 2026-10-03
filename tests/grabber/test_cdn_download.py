@@ -1,6 +1,7 @@
 import asyncio
 import os
 from hashlib import sha256
+from types import SimpleNamespace
 
 import pytest
 
@@ -304,3 +305,25 @@ def test_terminate_stops_the_sessions_to_other_dcs(monkeypatch):
     assert sorted(stopped) == ["cdn203", "dc4", "media2"]
     assert client.sessions == {}
     assert client.media_sessions == {}
+
+
+def test_a_cdn_dc_missing_from_the_config_falls_back_to_its_known_address():
+    async def scenario():
+        client = await offline_client()
+
+        async def invoke(query, *args, **kwargs):
+            return SimpleNamespace(
+                this_dc=2,
+                dc_options=[raw.types.DcOption(id=2, ip_address="149.154.167.51", port=443)],
+            )
+
+        client.invoke = invoke
+        found = await client.get_dc_option(203, is_cdn=True)
+        with pytest.raises(ValueError, match="DC201 not found among 2"):
+            await client.get_dc_option(201, is_cdn=True)
+        return found
+
+    found = asyncio.run(scenario())
+
+    assert found.ip_address == "91.105.192.100"
+    assert found.cdn

@@ -310,13 +310,29 @@ def encrypt_inner_data(data: bytes, fingerprint: int) -> bytes:
     return encrypt(sha + data + padding, fingerprint)
 
 
+cdn_fingerprints = set()
+
+
+def describe_key(fingerprint) -> str:
+    if fingerprint is None:
+        return "none"
+
+    if fingerprint in cdn_fingerprints:
+        return "cdn"
+
+    if fingerprint in LEGACY_FINGERPRINTS:
+        return "legacy"
+
+    return "current" if fingerprint in server_public_keys else "unknown"
+
+
 def pick_fingerprint(offered) -> int:
     known = [fp for fp in offered if fp in server_public_keys]
 
     if not known:
-        raise ValueError("Public key not found")
+        raise ValueError(f"Public key not found among {list(offered)}")
 
-    return min(known, key=lambda fp: fp in LEGACY_FINGERPRINTS)
+    return min(known, key=lambda fp: (fp not in cdn_fingerprints, fp in LEGACY_FINGERPRINTS))
 
 
 def _der_length(data: bytes, offset: int) -> tuple[int, int]:

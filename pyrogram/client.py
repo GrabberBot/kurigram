@@ -272,6 +272,7 @@ class Client(Methods):
     MAX_CONCURRENT_TRANSMISSIONS = 1
     DOWNLOAD_PARALLELISM = 1
     MEDIA_CONNECTIONS = 1
+    KNOWN_CDN_ADDRESSES = {203: "91.105.192.100"}
     MAX_MESSAGE_CACHE_SIZE = 1000
     MAX_TOPIC_CACHE_SIZE = 1000
 
@@ -1655,7 +1656,7 @@ class Client(Methods):
 
         for public_key in config.public_keys:
             try:
-                rsa.add_public_key(public_key.public_key)
+                rsa.cdn_fingerprints.add(rsa.add_public_key(public_key.public_key))
             except ValueError as e:
                 log.warning("Skipping an unreadable CDN key for DC%s: %s", public_key.dc_id, e)
 
@@ -1673,8 +1674,19 @@ class Client(Methods):
 
         options = [dc for dc in self.__config.dc_options if dc.id == dc_id and dc.ipv6 == ipv6] # type: List[raw.types.DcOption]
 
+        if not options and is_cdn and dc_id in self.KNOWN_CDN_ADDRESSES:
+            return raw.types.DcOption(
+                id=dc_id,
+                ip_address=self.KNOWN_CDN_ADDRESSES[dc_id],
+                port=443,
+                cdn=True
+            )
+
         if not options:
-            raise ValueError(f"DC{dc_id} not found")
+            listed = sorted(
+                {f"{dc.id}{'cdn' if dc.cdn else ''}{'v6' if dc.ipv6 else ''}" for dc in self.__config.dc_options}
+            )
+            raise ValueError(f"DC{dc_id} not found among {', '.join(listed)}")
 
         if is_cdn:
             cdn_options = [dc for dc in options if dc.cdn]

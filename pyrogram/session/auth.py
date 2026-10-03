@@ -107,10 +107,15 @@ class Auth:
                 loop=self.loop
             )
 
+            step = "connect"
+            offered = []
+            public_key_fingerprint = None
+
             try:
                 log.info("Start creating a new auth key on DC%s", self.dc_id)
 
                 await self.connection.connect()
+                step = "req_pq_multi"
 
                 # Step 1; Step 2
                 nonce = int.from_bytes(urandom(16), "little", signed=True)
@@ -119,7 +124,8 @@ class Auth:
                 log.debug("Got ResPq: %s", res_pq.server_nonce)
                 log.debug("Server public key fingerprints: %s", res_pq.server_public_key_fingerprints)
 
-                public_key_fingerprint = rsa.pick_fingerprint(res_pq.server_public_key_fingerprints)
+                offered = list(res_pq.server_public_key_fingerprints)
+                public_key_fingerprint = rsa.pick_fingerprint(offered)
                 log.debug("Using fingerprint: %s", public_key_fingerprint)
 
                 # Step 3
@@ -150,6 +156,7 @@ class Auth:
 
                 # Step 5. TODO: Handle "server_DH_params_fail". Code assumes response is ok
                 log.debug("Send req_DH_params")
+                step = "req_DH_params"
                 server_dh_params = await self.invoke(
                     raw.functions.ReqDHParams(
                         nonce=nonce,
@@ -210,6 +217,7 @@ class Auth:
                 encrypted_data = aes.ige256_encrypt(data_with_hash, tmp_aes_key, tmp_aes_iv)
 
                 log.debug("Send set_client_DH_params")
+                step = "set_client_DH_params"
                 set_client_dh_params_answer = await self.invoke(
                     raw.functions.SetClientDHParams(
                         nonce=nonce,
@@ -288,7 +296,14 @@ class Auth:
                 log.info("Done auth key exchange: %s", set_client_dh_params_answer.__class__.__name__)
             except ConnectionError as e:
                 log.info("Unable to connect due to network issues.")
-                raise e
+
+                if step == "connect":
+                    raise e
+
+                raise ConnectionError(
+                    f"{e} at {step}, offered keys {offered}, used {public_key_fingerprint} "
+                    f"({rsa.describe_key(public_key_fingerprint)})"
+                ) from e
             except Exception as e:
                 log.info("Retrying due to %s: %s", type(e).__name__, e)
 
